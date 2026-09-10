@@ -630,9 +630,15 @@ class AIEngine:
                     self.error=f"Custom YOLO failed: {exc}"
 
     def load(self):
-        if self.ready or self.loading: return
+        # Do not use self.ready as the startup guard here.
+        # self.ready may be True because Gemini is configured, even when
+        # the primary custom YOLO detector has not been loaded yet.
+        if self.loading: return
         self.loading=True; self.error=None
-        self.load_detector()
+        # YOLO is the primary engine. If it was not loaded during the
+        # explicit startup step, make one more attempt here.
+        if self.detector is None:
+            self.load_detector()
         self.load_gemini()
         # A custom model is enough to serve the app. CLIP is a fallback/second stage, not a hard dependency.
         try:
@@ -985,6 +991,14 @@ Rules:
 
 
 engine=AIEngine()
+
+# Load the custom YOLO detector synchronously at startup so a configured
+# Gemini fallback can never prevent YOLO from being initialized.
+# Priority: runs/electronics/weights/best.pt -> models/best.pt -> weights/best.pt
+engine.load_detector()
+
+# CLIP/Gemini are fallback/secondary components and may continue loading
+# in the background without blocking YOLO availability.
 threading.Thread(target=engine.load,name="ai-loader",daemon=True).start()
 
 app=Flask(__name__)
