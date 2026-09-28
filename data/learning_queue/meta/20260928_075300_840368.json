@@ -1,0 +1,13 @@
+{
+  "created_at": "2026-09-28T07:53:32+00:00",
+  "analysis_id": "20260928_075300_840368",
+  "label": "Arduino UNO",
+  "raw_label": "Arduino_UNO_R3",
+  "class_id": 20,
+  "image": "data\\learning_queue\\images\\20260928_075332_725875_20260928_075300_840368.jpg",
+  "label_file": null,
+  "source_image": "uploads\\20260928_075255_322476_Arduino_Uno_-_R3.jpg",
+  "requires_annotation": true,
+  "source_box": null,
+  "instruction": "Review before model training. Samples without label_file require manual bounding-box annotation."
+}

@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import traceback
 import hashlib
 import shutil
@@ -58,6 +59,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("ELECTRONICS_AI_GEMINI_MODEL", "gemini-3.8-flash").strip()
 GEMINI_MIN_ACCEPT = float(os.getenv("ELECTRONICS_AI_GEMINI_MIN_ACCEPT", "0.55"))
 GEMINI_MAX_DETECTIONS = max(1, min(10, int(os.getenv("ELECTRONICS_AI_GEMINI_MAX_DETECTIONS", "5"))))
+GEMINI_COOLDOWN_SECONDS = max(0, int(os.getenv("ELECTRONICS_AI_GEMINI_COOLDOWN_SECONDS", "900")))
 MAX_DETECTIONS = max(1, min(50, int(os.getenv("ELECTRONICS_AI_MAX_DETECTIONS", "20"))))
 DEDUP_IOU = float(os.getenv("ELECTRONICS_AI_DEDUP_IOU", "0.92"))
 MEMORY_SIMILARITY = float(os.getenv("ELECTRONICS_AI_MEMORY_SIMILARITY", "0.95"))
@@ -611,7 +613,7 @@ class AIEngine:
     def __init__(self):
         self.model=None; self.processor=None; self.model_name=None; self.text_features=None; self.class_prompts=None
         self.detector=None; self.detector_path=None
-        self.gemini_client=None; self.gemini_error=None
+        self.gemini_client=None; self.gemini_error=None; self.gemini_disabled_until=0.0; self.gemini_quota_exhausted=False
         self.lock=threading.Lock(); self.gemini_lock=threading.Lock(); self.loading=False; self.error=None
         self.device="cuda" if torch.cuda.is_available() else "cpu"
 
@@ -775,9 +777,14 @@ class AIEngine:
         return None
 
     def gemini_analyze(self, image):
-        """Cloud vision fallback used only when local YOLO is uncertain/unavailable."""
+        """Primary cloud vision stage. YOLO remains the core local detector and is used immediately when Gemini is unavailable/quota-limited."""
         if not GEMINI_ENABLED:
             return None
+        if self.gemini_quota_exhausted and time.time() < self.gemini_disabled_until:
+            return None
+        if self.gemini_quota_exhausted and time.time() >= self.gemini_disabled_until:
+            self.gemini_quota_exhausted = False
+            self.gemini_error = None
         if self.gemini_client is None:
             self.load_gemini()
         if self.gemini_client is None:
@@ -880,7 +887,20 @@ Rules:
                 "unknown_reason": "Gemini ประเมินความมั่นใจต่ำ" if top["score"] < GEMINI_MIN_ACCEPT else None,
             }
         except Exception as exc:
-            self.gemini_error = str(exc)[:500]
+            message = str(exc)[:1000]
+            lower = message.lower()
+            quota_error = (
+                "429" in lower
+                or "resource_exhausted" in lower
+                or "quota" in lower
+                or "rate limit" in lower
+                or "ratelimit" in lower
+                or "too many requests" in lower
+            )
+            self.gemini_error = message[:500]
+            if quota_error:
+                self.gemini_quota_exhausted = True
+                self.gemini_disabled_until = time.time() + GEMINI_COOLDOWN_SECONDS
             return None
 
     def clip_analyze(self, image):
@@ -960,33 +980,46 @@ Rules:
         return result
 
     def analyze(self, image):
-        # Hybrid pipeline: trained YOLO first -> Gemini Vision fallback -> CLIP fallback.
+        # Hybrid pipeline: Gemini first -> trained YOLO fallback -> CLIP final fallback.
+        # YOLO remains the core local detector and is never removed; it is used whenever
+        # Gemini is unavailable, quota-limited, errors, or returns low confidence.
+        g = self.gemini_analyze(image)
+        if g and not g.get("is_unknown"):
+            g["pipeline"] = "gemini-first"
+            return g
+
+        gemini_status = None
+        if self.gemini_quota_exhausted:
+            gemini_status = "quota_or_rate_limit"
+        elif g and g.get("is_unknown"):
+            gemini_status = "low_confidence"
+        elif self.gemini_error:
+            gemini_status = "unavailable_or_error"
+
         try:
             y = self.yolo_analyze(image)
             if y and not y.get("is_unknown"):
-                return self.verify_detections(image, y)
+                result = self.verify_detections(image, y)
+                result["pipeline"] = "yolo-after-gemini"
+                result["gemini_fallback"] = {"status": gemini_status or "not_accepted"}
+                return result
             low_conf_yolo = y
         except Exception as exc:
-            self.error = f"YOLO inference failed; using Gemini fallback: {exc}"
+            self.error = f"YOLO inference failed; using CLIP fallback: {exc}"
             low_conf_yolo = None
-
-        g = self.gemini_analyze(image)
-        if g and not g.get("is_unknown"):
-            if low_conf_yolo:
-                g["fallback_from_yolo"] = low_conf_yolo.get("top")
-            return g
 
         c = self.clip_analyze(image)
         if c:
             if low_conf_yolo and not c.get("is_unknown"):
                 c["fallback_from_yolo"] = low_conf_yolo.get("top")
-            if g and g.get("is_unknown"):
-                c["gemini_fallback"] = {"status": "low_confidence", "top": g.get("top")}
+            c["pipeline"] = "clip-after-gemini-yolo"
+            c["gemini_fallback"] = {"status": gemini_status or "not_accepted"}
             return c
-        if g:
-            return g
         if low_conf_yolo:
-            return self.verify_detections(image, low_conf_yolo)
+            result = self.verify_detections(image, low_conf_yolo)
+            result["pipeline"] = "yolo-low-confidence"
+            result["gemini_fallback"] = {"status": gemini_status or "not_accepted"}
+            return result
         raise RuntimeError(self.error or self.gemini_error or "No AI model is available")
 
 
@@ -1407,7 +1440,7 @@ def models_info():
     return jsonify({"success":True,"data":{
         "yolo":{"path":str(model_path) if model_path else None,"available":bool(model_path and model_path.exists())},
         "clip":{"name":engine.model_name,"available":engine.model is not None},
-        "gemini":{"enabled":GEMINI_ENABLED,"configured":bool(GEMINI_API_KEY),"available":engine.gemini_client is not None,"model":GEMINI_MODEL,"error":engine.gemini_error},
+        "gemini":{"enabled":GEMINI_ENABLED,"configured":bool(GEMINI_API_KEY),"available":engine.gemini_client is not None,"model":GEMINI_MODEL,"error":engine.gemini_error,"quota_exhausted":engine.gemini_quota_exhausted,"cooldown_seconds":max(0, int(engine.gemini_disabled_until-time.time()))},
         "device":engine.device,"classes":len(CLASSES),"dataset_version":"custom_dataset","last_trained":datetime.fromtimestamp(model_path.stat().st_mtime,timezone.utc).isoformat() if model_path and model_path.exists() else None
     }})
 

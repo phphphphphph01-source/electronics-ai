@@ -1,0 +1,13 @@
+{
+  "created_at": "2026-09-28T08:14:42+00:00",
+  "analysis_id": "20260928_081405_451628",
+  "label": "LCD display",
+  "raw_label": "LCD_16x2",
+  "class_id": 13,
+  "image": "data\\learning_queue\\images\\20260928_081442_392805_20260928_081405_451628.jpg",
+  "label_file": null,
+  "source_image": "uploads\\20260928_081350_271105_1602-lcd-16x2-16x2-character-lcd-display-9927821.webp",
+  "requires_annotation": true,
+  "source_box": null,
+  "instruction": "Review before model training. Samples without label_file require manual bounding-box annotation."
+}
